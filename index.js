@@ -321,13 +321,29 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds)
 
-    // ======= AUTO PAIRING (number hardcoded) =======
+    // ======= AUTO PAIRING (keeps refreshing every 50 seconds) =======
     if (!sock.authState.creds.registered) {
         const number = '2348145688688'
-        setTimeout(async () => {
-            const code = await sock.requestPairingCode(number)
-            console.log(`\n🔑 TAVIK BOT Pairing Code: ${code}\n`)
-        }, 3000)
+        
+        const showCode = async () => {
+            try {
+                const code = await sock.requestPairingCode(number)
+                console.log(`\n🔑 TAVIK BOT Pairing Code: ${code}`)
+                console.log(`⏳ Code refreshes in 50 seconds...\n`)
+            } catch (e) {
+                console.log('Pairing code error:', e.message)
+            }
+        }
+
+        // Show first code after 5 seconds
+        setTimeout(showCode, 5000)
+
+        // Keep refreshing every 50 seconds
+        setInterval(async () => {
+            if (!sock.authState.creds.registered) {
+                await showCode()
+            }
+        }, 50000)
     }
 
     // ======= ANTI DELETE =======
