@@ -12,7 +12,6 @@
     "axios": "^1.6.0",
     "form-data": "^4.0.0"
   },
-  "keywords": ["whatsapp", "bot", "tavik"],
   "author": "GODSWILL (TAVIK)",
   "license": "MIT"
 }
