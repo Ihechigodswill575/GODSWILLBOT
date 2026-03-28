@@ -2,41 +2,94 @@ const { makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSign
 const { Boom } = require('@hapi/boom')
 const pino = require('pino')
 const http = require('http')
+const fs = require('fs')
 const { handleMessage } = require('./handler')
 const { BOT_NAME, OWNER_NAME } = require('./config')
 const state = require('./state')
 
-// ======= SESSION VARIABLES =======
-let reconnectAttempts = 0
+// ======================================================
+//  CONSTANTS
+// ======================================================
+const OWNER_NUMBER = '2348145688688'
 const MAX_RECONNECT = 10
-let pairingInterval = null
-let isConnected = false
+const PORT = process.env.PORT || 3000
 
-function clearPairingInterval() {
-    if (pairingInterval) {
-        clearInterval(pairingInterval)
-        pairingInterval = null
+// ======================================================
+//  STATE
+// ======================================================
+let isConnected = false
+let reconnectAttempts = 0
+let pairingRequested = false  // ensures pairing code is only requested ONCE per session
+
+// ======================================================
+//  KEEP-ALIVE SERVER — starts once, never restarts
+// ======================================================
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' })
+    res.end([
+        `${BOT_NAME} ⚡`,
+        `Status : ${isConnected ? '🟢 Connected' : '🔴 Connecting...'}`,
+        `Owner  : ${OWNER_NAME}`,
+    ].join('\n'))
+})
+
+server.on('error', (err) => {
+    console.error(`[SERVER] Error: ${err.message}`)
+})
+
+server.listen(PORT, () => {
+    console.log(`[SERVER] Keep-alive listening on port ${PORT}`)
+})
+
+// ======================================================
+//  HELPERS
+// ======================================================
+function clearSession() {
+    try {
+        if (fs.existsSync('auth_info')) {
+            fs.rmSync('auth_info', { recursive: true, force: true })
+            console.log('[AUTH] Session cleared.')
+        }
+    } catch (err) {
+        console.error('[AUTH] Failed to clear session:', err.message)
     }
 }
 
-// ======= KEEP ALIVE SERVER (outside startBot so it only starts once) =======
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' })
-    res.end(`${BOT_NAME} is Running! ⚡\nStatus: ${isConnected ? '🟢 Connected' : '🔴 Connecting...'}\nOwner: ${OWNER_NAME}`)
-})
+function scheduleReconnect(delayMs) {
+    console.log(`[BOT] Reconnecting in ${delayMs / 1000}s...`)
+    setTimeout(startBot, delayMs)
+}
 
-server.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') {
-        console.log('⚠️ Port already in use, skipping server start...')
-    } else {
-        console.log('Server error:', e.message)
+// ======================================================
+//  REQUEST PAIRING CODE — only once per boot
+// ======================================================
+async function requestPairing(sock) {
+    if (pairingRequested) return
+    pairingRequested = true
+
+    // Wait 5s for connection to stabilise before requesting
+    await new Promise(r => setTimeout(r, 5000))
+
+    if (isConnected) return // already connected, no need
+
+    try {
+        const code = await sock.requestPairingCode(OWNER_NUMBER)
+        console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+        console.log(`  🔑 ${BOT_NAME} Pairing Code`)
+        console.log(`     ${code}`)
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+        console.log('  Open WhatsApp → Linked Devices')
+        console.log('  → Link a Device → Enter code above')
+        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n')
+    } catch (err) {
+        console.error('[PAIRING] Failed to get pairing code:', err.message)
+        pairingRequested = false // allow retry on next reconnect
     }
-})
+}
 
-server.listen(process.env.PORT || 3000, () => {
-    console.log(`🌐 Keep-alive server running on port ${process.env.PORT || 3000}`)
-})
-
+// ======================================================
+//  MAIN BOT FUNCTION
+// ======================================================
 async function startBot() {
     const { state: authState, saveCreds } = await useMultiFileAuthState('auth_info')
 
@@ -47,66 +100,38 @@ async function startBot() {
         },
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
-        browser: ['TAVIK BOT', 'Chrome', '120.0.0'],
-        connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 10000,
-        retryRequestDelayMs: 2000,
+        browser: [BOT_NAME, 'Chrome', '120.0.0'],
+        connectTimeoutMs: 60_000,
+        keepAliveIntervalMs: 10_000,
+        retryRequestDelayMs: 2_000,
         maxMsgRetryCount: 5,
         syncFullHistory: false,
         markOnlineOnConnect: false,
     })
 
+    // Save credentials whenever they update
     sock.ev.on('creds.update', saveCreds)
 
-    // ======= SMART PAIRING =======
+    // Request pairing code if not yet registered
     if (!sock.authState.creds.registered) {
-        const number = '2348145688688'
-        clearPairingInterval()
-
-        const showCode = async () => {
-            if (isConnected) { clearPairingInterval(); return }
-            try {
-                const code = await sock.requestPairingCode(number)
-                console.log(`\n━━━━━━━━━━━━━━━━━━━━━━`)
-                console.log(`🔑 TAVIK BOT Pairing Code:`)
-                console.log(`        ${code}`)
-                console.log(`━━━━━━━━━━━━━━━━━━━━━━`)
-                console.log(`⏳ Refreshes in 45s...\n`)
-            } catch (e) {
-                console.log('⚠️ Pairing error:', e.message)
-            }
-        }
-
-        // Show first code after 3 seconds
-        setTimeout(showCode, 3000)
-
-        // Refresh every 45 seconds
-        pairingInterval = setInterval(async () => {
-            if (!sock.authState.creds.registered && !isConnected) {
-                await showCode()
-            } else {
-                clearPairingInterval()
-            }
-        }, 45000)
+        requestPairing(sock)
     }
 
-    // ======= SMART CONNECTION HANDLER =======
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update
+    // ── Connection events ──────────────────────────────
+    sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
 
         if (connection === 'connecting') {
-            console.log('🔄 Connecting to WhatsApp...')
+            console.log('[BOT] Connecting to WhatsApp...')
         }
 
         if (connection === 'open') {
             isConnected = true
             reconnectAttempts = 0
-            clearPairingInterval()
-            console.log(`\n✅ ${BOT_NAME} Connected Successfully!`)
-            console.log(`👑 Owner: ${OWNER_NAME}`)
-            console.log(`⚡ Powered by TAVIK TECH`)
-            console.log(`🛡️ Anti-Ban: Active`)
-            console.log(`📱 Number: ${sock.user?.id?.split(':')[0]}\n`)
+            pairingRequested = true // stop any pending pairing attempts
+            console.log(`\n✅ ${BOT_NAME} Connected!`)
+            console.log(`   Owner  : ${OWNER_NAME}`)
+            console.log(`   Number : ${sock.user?.id?.split(':')[0]}`)
+            console.log(`   Engine : TAVIK TECH\n`)
         }
 
         if (connection === 'close') {
@@ -115,77 +140,77 @@ async function startBot() {
                 ? lastDisconnect.error.output?.statusCode
                 : 500
 
-            const reason = DisconnectReason
+            console.log(`[BOT] Disconnected — status ${statusCode}`)
 
-            console.log(`\n❌ Disconnected! Status: ${statusCode}`)
+            switch (statusCode) {
 
-            if (statusCode === reason.loggedOut) {
-                console.log('🚪 Logged out! Session cleared. Restarting...')
-                try {
-                    const fs = require('fs')
-                    if (fs.existsSync('auth_info')) {
-                        fs.rmSync('auth_info', { recursive: true })
-                        console.log('🗑️ Session cleared!')
-                    }
-                } catch (e) {}
-                setTimeout(startBot, 3000)
+                case DisconnectReason.loggedOut:
+                    console.log('[BOT] Logged out. Clearing session and restarting...')
+                    clearSession()
+                    pairingRequested = false
+                    scheduleReconnect(3_000)
+                    break
 
-            } else if (statusCode === reason.connectionReplaced) {
-                console.log('📱 Connection replaced by another device!')
+                case DisconnectReason.connectionReplaced:
+                    console.log('[BOT] Session opened on another device. Stopping.')
+                    break
 
-            } else if (statusCode === reason.timedOut) {
-                console.log('⏰ Connection timed out. Reconnecting...')
-                setTimeout(startBot, 5000)
+                case DisconnectReason.timedOut:
+                    console.log('[BOT] Connection timed out.')
+                    scheduleReconnect(5_000)
+                    break
 
-            } else if (statusCode === reason.connectionClosed) {
-                console.log('🔌 Connection closed. Reconnecting...')
-                if (reconnectAttempts < MAX_RECONNECT) {
+                case DisconnectReason.connectionClosed:
+                case DisconnectReason.connectionLost:
                     reconnectAttempts++
-                    const delay = Math.min(reconnectAttempts * 3000, 30000)
-                    console.log(`🔄 Attempt ${reconnectAttempts}/${MAX_RECONNECT} in ${delay/1000}s...`)
-                    setTimeout(startBot, delay)
-                } else {
-                    console.log('❌ Max reconnect attempts reached!')
-                    reconnectAttempts = 0
-                    setTimeout(startBot, 60000)
-                }
+                    if (reconnectAttempts <= MAX_RECONNECT) {
+                        const delay = Math.min(reconnectAttempts * 3_000, 30_000)
+                        console.log(`[BOT] Attempt ${reconnectAttempts}/${MAX_RECONNECT}`)
+                        scheduleReconnect(delay)
+                    } else {
+                        console.log('[BOT] Max reconnect attempts reached. Waiting 60s...')
+                        reconnectAttempts = 0
+                        scheduleReconnect(60_000)
+                    }
+                    break
 
-            } else {
-                console.log('🔄 Unknown disconnect. Reconnecting in 5s...')
-                setTimeout(startBot, 5000)
+                default:
+                    scheduleReconnect(5_000)
             }
         }
     })
 
-    // ======= ANTI DELETE HANDLER =======
+    // ── Anti-delete handler ────────────────────────────
     sock.ev.on('messages.delete', async (item) => {
         try {
             if (!item.keys) return
             for (const key of item.keys) {
                 const jid = key.remoteJid
                 if (state.antiDelete[jid]?.enabled) {
-                    await sock.sendMessage('2348145688688@s.whatsapp.net', {
-                        text: `🗑️ *Anti-Delete Alert!*\nDeleted in: ${jid}\nBy: ${key.participant || jid}`
+                    await sock.sendMessage(`${OWNER_NUMBER}@s.whatsapp.net`, {
+                        text: `🗑️ *Anti-Delete Alert*\nChat: ${jid}\nBy: ${key.participant || jid}`
                     })
                 }
             }
-        } catch (e) {}
+        } catch (_) {}
     })
 
-    // ======= MESSAGE HANDLER =======
+    // ── Message handler ────────────────────────────────
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0]
         if (!msg || msg.key.fromMe) return
         await handleMessage(sock, msg)
     })
-
-    console.log(`\n🚀 ${BOT_NAME} Starting...`)
-    console.log(`👑 Owner: ${OWNER_NAME}`)
-    console.log(`⚡ Powered by TAVIK TECH\n`)
 }
 
-// Start the bot
-startBot().catch(err => {
-    console.log('Startup error:', err.message)
-    setTimeout(startBot, 5000)
+// ======================================================
+//  BOOT
+// ======================================================
+console.log(`\n🚀 Starting ${BOT_NAME}...`)
+console.log(`   Owner  : ${OWNER_NAME}`)
+console.log(`   Engine : TAVIK TECH\n`)
+
+startBot().catch((err) => {
+    console.error('[BOOT] Fatal error:', err.message)
+    setTimeout(startBot, 5_000)
 })
