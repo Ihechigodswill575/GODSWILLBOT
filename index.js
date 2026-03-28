@@ -4,6 +4,14 @@ const pino = require('pino')
 const axios = require('axios')
 const fs = require('fs')
 
+// ======= CRASH PROTECTION =======
+process.on('uncaughtException', (err) => {
+    console.log('Uncaught Exception:', err.message)
+})
+process.on('unhandledRejection', (err) => {
+    console.log('Unhandled Rejection:', err?.message || err)
+})
+
 // ======= CONFIG =======
 const OWNER_NUMBER = '2348145688688'
 const OWNER = OWNER_NUMBER + '@s.whatsapp.net'
@@ -1287,10 +1295,20 @@ async function startBot() {
     })
 
     // Keep alive
-    http.createServer((req, res) => res.end(`${BOT_NAME} Running! ⚡`)).listen(3000)
-    console.log(`\n✅ ${BOT_NAME} ${BOT_VERSION} Started!`)
-    console.log(`👑 Owner: ${OWNER_NAME}`)
-    console.log(`⚡ Powered by TAVIK TECH\n`)
+    const server = http.createServer((req, res) => res.end(`${BOT_NAME} Running! ⚡`))
+    server.listen(3000, () => {
+        console.log(`\n✅ ${BOT_NAME} ${BOT_VERSION} Started!`)
+        console.log(`👑 Owner: ${OWNER_NAME}`)
+        console.log(`⚡ Powered by TAVIK TECH\n`)
+    })
+    server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+            console.log('Port 3000 busy, trying 3001...')
+            server.listen(3001)
+        } else {
+            console.log('Server error:', err.message)
+        }
+    })
 }
 
 startBot()
