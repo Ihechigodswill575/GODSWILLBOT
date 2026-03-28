@@ -1,216 +1,242 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys')
-const { Boom } = require('@hapi/boom')
-const pino = require('pino')
-const http = require('http')
-const fs = require('fs')
+/**
+ * ============================================================
+ *  TAVIK BOT — index.js
+ *  Author  : GODSWILL (TAVIK)
+ *  Engine  : TAVIK TECH
+ * ============================================================
+ */
+
+'use strict'
+
+const {
+    makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    makeCacheableSignalKeyStore,
+    fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys')
+const { Boom }        = require('@hapi/boom')
+const pino            = require('pino')
+const http            = require('http')
+const fs              = require('fs')
 const { handleMessage } = require('./handler')
-const { BOT_NAME, OWNER_NAME } = require('./config')
-const state = require('./state')
+const { BOT_NAME, OWNER_NAME, OWNER_NUMBER } = require('./config')
+const state           = require('./state')
 
-// ======================================================
-//  CONSTANTS
-// ======================================================
-const OWNER_NUMBER = '2348145688688'
-const MAX_RECONNECT = 10
-const PORT = process.env.PORT || 3000
+// ── Constants ────────────────────────────────────────────────
+const PORT         = process.env.PORT || 3000
+const AUTH_FOLDER  = 'auth_info'
+const MAX_RETRIES  = 10
+const logger       = pino({ level: 'silent' })
 
-// ======================================================
-//  STATE
-// ======================================================
-let isConnected = false
-let reconnectAttempts = 0
-let pairingRequested = false  // ensures pairing code is only requested ONCE per session
+// ── Runtime state ────────────────────────────────────────────
+let isConnected      = false
+let retryCount       = 0
+let currentSock      = null   // track active socket so we can close it cleanly
+let pairingDone      = false  // true once code shown OR session already exists
 
-// ======================================================
-//  KEEP-ALIVE SERVER — starts once, never restarts
-// ======================================================
-const server = http.createServer((req, res) => {
+// ── Keep-alive server (starts ONCE at boot, never again) ─────
+const server = http.createServer((_, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' })
-    res.end([
-        `${BOT_NAME} ⚡`,
-        `Status : ${isConnected ? '🟢 Connected' : '🔴 Connecting...'}`,
-        `Owner  : ${OWNER_NAME}`,
-    ].join('\n'))
+    res.end(
+        `${BOT_NAME}\n` +
+        `Status : ${isConnected ? 'Connected ✅' : 'Connecting... 🔄'}\n` +
+        `Owner  : ${OWNER_NAME}`
+    )
 })
 
-server.on('error', (err) => {
-    console.error(`[SERVER] Error: ${err.message}`)
-})
+server.on('error', err => console.error(`[SERVER] ${err.message}`))
+server.listen(PORT, () => console.log(`[SERVER] Running on port ${PORT}`))
 
-server.listen(PORT, () => {
-    console.log(`[SERVER] Keep-alive listening on port ${PORT}`)
-})
+// ── Helpers ──────────────────────────────────────────────────
+function log(tag, msg)  { console.log(`[${tag}] ${msg}`) }
+function err(tag, msg)  { console.error(`[${tag}] ${msg}`) }
 
-// ======================================================
-//  HELPERS
-// ======================================================
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
+
 function clearSession() {
     try {
-        if (fs.existsSync('auth_info')) {
-            fs.rmSync('auth_info', { recursive: true, force: true })
-            console.log('[AUTH] Session cleared.')
+        if (fs.existsSync(AUTH_FOLDER)) {
+            fs.rmSync(AUTH_FOLDER, { recursive: true, force: true })
+            log('AUTH', 'Session cleared.')
         }
-    } catch (err) {
-        console.error('[AUTH] Failed to clear session:', err.message)
+    } catch (e) {
+        err('AUTH', `Could not clear session: ${e.message}`)
     }
 }
 
-function scheduleReconnect(delayMs) {
-    console.log(`[BOT] Reconnecting in ${delayMs / 1000}s...`)
+function destroySocket() {
+    if (currentSock) {
+        try { currentSock.ev.removeAllListeners() } catch (_) {}
+        try { currentSock.ws?.close()             } catch (_) {}
+        currentSock = null
+    }
+}
+
+function reconnect(delayMs) {
+    log('BOT', `Next attempt in ${delayMs / 1000}s...`)
     setTimeout(startBot, delayMs)
 }
 
-// ======================================================
-//  REQUEST PAIRING CODE — only once per boot
-// ======================================================
+// ── Pairing — requested exactly once, only when needed ───────
 async function requestPairing(sock) {
-    if (pairingRequested) return
-    pairingRequested = true
+    if (pairingDone) return
+    pairingDone = true
 
-    // Wait 5s for connection to stabilise before requesting
-    await new Promise(r => setTimeout(r, 5000))
+    // Give WhatsApp 8 seconds to attempt auto-login first
+    await sleep(8000)
 
-    if (isConnected) return // already connected, no need
+    // If bot connected during that wait, no pairing needed
+    if (isConnected) return
 
     try {
         const code = await sock.requestPairingCode(OWNER_NUMBER)
-        console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
-        console.log(`  🔑 ${BOT_NAME} Pairing Code`)
-        console.log(`     ${code}`)
-        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
-        console.log('  Open WhatsApp → Linked Devices')
-        console.log('  → Link a Device → Enter code above')
-        console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n')
-    } catch (err) {
-        console.error('[PAIRING] Failed to get pairing code:', err.message)
-        pairingRequested = false // allow retry on next reconnect
+        console.log('\n╔══════════════════════════════╗')
+        console.log(`║   🔑  ${BOT_NAME} Pairing Code   ║`)
+        console.log(`║        ${code.padEnd(20)}  ║`)
+        console.log('╠══════════════════════════════╣')
+        console.log('║  WhatsApp → Linked Devices   ║')
+        console.log('║  → Link a Device → Enter code║')
+        console.log('╚══════════════════════════════╝\n')
+    } catch (e) {
+        err('PAIRING', e.message)
+        pairingDone = false   // reset so next reconnect can try again
     }
 }
 
-// ======================================================
-//  MAIN BOT FUNCTION
-// ======================================================
+// ── Main bot function ─────────────────────────────────────────
 async function startBot() {
-    const { state: authState, saveCreds } = await useMultiFileAuthState('auth_info')
+    // Clean up any previous socket before making a new one
+    destroySocket()
 
-    const sock = makeWASocket({
-        auth: {
-            creds: authState.creds,
-            keys: makeCacheableSignalKeyStore(authState.keys, pino({ level: 'silent' }))
-        },
-        printQRInTerminal: false,
-        logger: pino({ level: 'silent' }),
-        browser: [BOT_NAME, 'Chrome', '120.0.0'],
-        connectTimeoutMs: 60_000,
-        keepAliveIntervalMs: 10_000,
-        retryRequestDelayMs: 2_000,
-        maxMsgRetryCount: 5,
-        syncFullHistory: false,
-        markOnlineOnConnect: false,
-    })
+    try {
+        const { version } = await fetchLatestBaileysVersion()
+        const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER)
 
-    // Save credentials whenever they update
-    sock.ev.on('creds.update', saveCreds)
+        const sock = makeWASocket({
+            version,
+            auth: {
+                creds: authState.creds,
+                keys: makeCacheableSignalKeyStore(authState.keys, logger),
+            },
+            printQRInTerminal : false,
+            logger,
+            browser           : [BOT_NAME, 'Chrome', '120.0.0'],
+            connectTimeoutMs  : 60_000,
+            keepAliveIntervalMs: 25_000,
+            retryRequestDelayMs: 2_000,
+            maxMsgRetryCount  : 3,
+            syncFullHistory   : false,
+            markOnlineOnConnect: false,
+        })
 
-    // Request pairing code if not yet registered
-    if (!sock.authState.creds.registered) {
-        requestPairing(sock)
-    }
+        currentSock = sock
+        sock.ev.on('creds.update', saveCreds)
 
-    // ── Connection events ──────────────────────────────
-    sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
-
-        if (connection === 'connecting') {
-            console.log('[BOT] Connecting to WhatsApp...')
+        // Only request pairing if not already registered
+        if (!sock.authState.creds.registered) {
+            requestPairing(sock)
+        } else {
+            pairingDone = true  // session exists, no pairing needed
         }
 
-        if (connection === 'open') {
-            isConnected = true
-            reconnectAttempts = 0
-            pairingRequested = true // stop any pending pairing attempts
-            console.log(`\n✅ ${BOT_NAME} Connected!`)
-            console.log(`   Owner  : ${OWNER_NAME}`)
-            console.log(`   Number : ${sock.user?.id?.split(':')[0]}`)
-            console.log(`   Engine : TAVIK TECH\n`)
-        }
+        // ── Connection handler ──────────────────────────────
+        sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
 
-        if (connection === 'close') {
-            isConnected = false
-            const statusCode = (lastDisconnect?.error instanceof Boom)
-                ? lastDisconnect.error.output?.statusCode
-                : 500
-
-            console.log(`[BOT] Disconnected — status ${statusCode}`)
-
-            switch (statusCode) {
-
-                case DisconnectReason.loggedOut:
-                    console.log('[BOT] Logged out. Clearing session and restarting...')
-                    clearSession()
-                    pairingRequested = false
-                    scheduleReconnect(3_000)
-                    break
-
-                case DisconnectReason.connectionReplaced:
-                    console.log('[BOT] Session opened on another device. Stopping.')
-                    break
-
-                case DisconnectReason.timedOut:
-                    console.log('[BOT] Connection timed out.')
-                    scheduleReconnect(5_000)
-                    break
-
-                case DisconnectReason.connectionClosed:
-                case DisconnectReason.connectionLost:
-                    reconnectAttempts++
-                    if (reconnectAttempts <= MAX_RECONNECT) {
-                        const delay = Math.min(reconnectAttempts * 3_000, 30_000)
-                        console.log(`[BOT] Attempt ${reconnectAttempts}/${MAX_RECONNECT}`)
-                        scheduleReconnect(delay)
-                    } else {
-                        console.log('[BOT] Max reconnect attempts reached. Waiting 60s...')
-                        reconnectAttempts = 0
-                        scheduleReconnect(60_000)
-                    }
-                    break
-
-                default:
-                    scheduleReconnect(5_000)
+            if (connection === 'connecting') {
+                log('BOT', 'Connecting to WhatsApp...')
             }
-        }
-    })
 
-    // ── Anti-delete handler ────────────────────────────
-    sock.ev.on('messages.delete', async (item) => {
-        try {
-            if (!item.keys) return
-            for (const key of item.keys) {
-                const jid = key.remoteJid
-                if (state.antiDelete[jid]?.enabled) {
-                    await sock.sendMessage(`${OWNER_NUMBER}@s.whatsapp.net`, {
-                        text: `🗑️ *Anti-Delete Alert*\nChat: ${jid}\nBy: ${key.participant || jid}`
-                    })
+            if (connection === 'open') {
+                isConnected  = true
+                retryCount   = 0
+                pairingDone  = true
+                console.log(`\n✅ ${BOT_NAME} is LIVE`)
+                console.log(`   Owner  : ${OWNER_NAME}`)
+                console.log(`   Number : ${sock.user?.id?.split(':')[0]}`)
+                console.log(`   Engine : TAVIK TECH\n`)
+            }
+
+            if (connection === 'close') {
+                isConnected = false
+                const boom  = lastDisconnect?.error
+                const code  = (boom instanceof Boom)
+                    ? boom.output?.statusCode
+                    : 500
+
+                log('BOT', `Disconnected — code ${code}`)
+
+                switch (code) {
+
+                    case DisconnectReason.loggedOut:
+                        log('BOT', 'Logged out. Clearing session...')
+                        clearSession()
+                        pairingDone = false   // allow fresh pairing
+                        retryCount  = 0
+                        reconnect(3_000)
+                        break
+
+                    case DisconnectReason.connectionReplaced:
+                        log('BOT', 'Another device took over. Halting.')
+                        // Do NOT reconnect
+                        break
+
+                    case DisconnectReason.badSession:
+                        log('BOT', 'Bad session. Clearing and restarting...')
+                        clearSession()
+                        pairingDone = false
+                        reconnect(5_000)
+                        break
+
+                    case DisconnectReason.timedOut:
+                    case DisconnectReason.connectionClosed:
+                    case DisconnectReason.connectionLost:
+                    default:
+                        retryCount++
+                        if (retryCount <= MAX_RETRIES) {
+                            const delay = Math.min(retryCount * 4_000, 30_000)
+                            log('BOT', `Retry ${retryCount}/${MAX_RETRIES}`)
+                            reconnect(delay)
+                        } else {
+                            log('BOT', 'Max retries hit. Cooling down 60s...')
+                            retryCount = 0
+                            reconnect(60_000)
+                        }
                 }
             }
-        } catch (_) {}
-    })
+        })
 
-    // ── Message handler ────────────────────────────────
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        const msg = messages[0]
-        if (!msg || msg.key.fromMe) return
-        await handleMessage(sock, msg)
-    })
+        // ── Anti-delete ─────────────────────────────────────
+        sock.ev.on('messages.delete', async (item) => {
+            try {
+                if (!item?.keys) return
+                for (const key of item.keys) {
+                    const jid = key.remoteJid
+                    if (!state.antiDelete[jid]?.enabled) continue
+                    await sock.sendMessage(`${OWNER_NUMBER}@s.whatsapp.net`, {
+                        text: `🗑️ *Anti-Delete Alert*\nChat : ${jid}\nBy   : ${key.participant || jid}`
+                    })
+                }
+            } catch (_) {}
+        })
+
+        // ── Message router ──────────────────────────────────
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify') return
+            const msg = messages[0]
+            if (!msg || msg.key.fromMe) return
+            await handleMessage(sock, msg)
+        })
+
+    } catch (e) {
+        err('BOOT', e.message)
+        reconnect(5_000)
+    }
 }
 
-// ======================================================
-//  BOOT
-// ======================================================
-console.log(`\n🚀 Starting ${BOT_NAME}...`)
+// ── Boot ─────────────────────────────────────────────────────
+console.log(`\n🚀 ${BOT_NAME} starting...`)
 console.log(`   Owner  : ${OWNER_NAME}`)
 console.log(`   Engine : TAVIK TECH\n`)
 
-startBot().catch((err) => {
-    console.error('[BOOT] Fatal error:', err.message)
-    setTimeout(startBot, 5_000)
-})
+startBot()
