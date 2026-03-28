@@ -13,7 +13,7 @@ const {
     useMultiFileAuthState,
     DisconnectReason,
     makeCacheableSignalKeyStore,
-    fetchLatestBaileysVersion,
+    Browsers,
 } = require('@whiskeysockets/baileys')
 const { Boom }           = require('@hapi/boom')
 const pino               = require('pino')
@@ -28,14 +28,14 @@ const PORT           = process.env.PORT || 3000
 const AUTH_FOLDER    = 'auth_info'
 const MAX_RETRIES    = 10
 const logger         = pino({ level: 'silent' })
-const PAIRING_NUMBER = OWNER_NUMBER.replace(/[^0-9]/g, '') // digits only
+const PAIRING_NUMBER = OWNER_NUMBER.replace(/[^0-9]/g, '') // digits only, no + or spaces
 
 // ── Runtime state ────────────────────────────────────────────
-let isConnected   = false
-let retryCount    = 0
-let currentSock   = null
-let pairingTimer  = null
-let pairingShown  = false  // ensures we only start the pairing flow once per boot
+let isConnected  = false
+let retryCount   = 0
+let currentSock  = null
+let pairingTimer = null
+let pairingShown = false
 
 // ── Keep-alive server — boots ONCE ───────────────────────────
 const server = http.createServer((_, res) => {
@@ -53,10 +53,7 @@ server.listen(PORT, () => console.log(`[SERVER] Running on port ${PORT}`))
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
 function stopPairingTimer() {
-    if (pairingTimer) {
-        clearInterval(pairingTimer)
-        pairingTimer = null
-    }
+    if (pairingTimer) { clearInterval(pairingTimer); pairingTimer = null }
 }
 
 function clearSession() {
@@ -65,9 +62,7 @@ function clearSession() {
             fs.rmSync(AUTH_FOLDER, { recursive: true, force: true })
             console.log('[AUTH] Session cleared.')
         }
-    } catch (e) {
-        console.error(`[AUTH] ${e.message}`)
-    }
+    } catch (e) { console.error(`[AUTH] ${e.message}`) }
 }
 
 function destroySocket() {
@@ -83,9 +78,7 @@ function reconnect(delayMs) {
     setTimeout(startBot, delayMs)
 }
 
-// ── Pairing — triggered AFTER 'connecting' event fires ───────
-// This is the correct time per Baileys docs.
-// Code refreshes every 55s since WhatsApp codes expire in ~60s.
+// ── Pairing — correct implementation per Baileys docs ────────
 async function startPairing(sock) {
     if (pairingShown) return
     pairingShown = true
@@ -98,7 +91,7 @@ async function startPairing(sock) {
         }
         try {
             const code      = await sock.requestPairingCode(PAIRING_NUMBER)
-            const formatted = code.match(/.{1,4}/g)?.join('-') || code
+            const formatted = code?.match(/.{1,4}/g)?.join('-') || code
             console.log('\n┌─────────────────────────────────┐')
             console.log(`│     🔑  TAVIK BOT Pairing Code   │`)
             console.log(`│                                  │`)
@@ -109,18 +102,15 @@ async function startPairing(sock) {
             console.log('│  3. Tap "Link a Device"          │')
             console.log('│  4. Enter the code above NOW     │')
             console.log('│                                  │')
-            console.log('│  ⏳ Refreshes automatically       │')
+            console.log('│  ⏳ Auto-refreshes every 55s      │')
             console.log('└─────────────────────────────────┘\n')
         } catch (e) {
             console.error(`[PAIRING] Failed: ${e.message}`)
-            pairingShown = false // allow retry
+            pairingShown = false
         }
     }
 
-    // Show first code immediately
     await showCode()
-
-    // Refresh every 55s automatically
     pairingTimer = setInterval(showCode, 55_000)
 }
 
@@ -130,18 +120,24 @@ async function startBot() {
     stopPairingTimer()
 
     try {
-        const { version }                     = await fetchLatestBaileysVersion()
         const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER)
 
+        const isRegistered = authState.creds.registered
+
         const sock = makeWASocket({
-            version,
             auth: {
                 creds: authState.creds,
                 keys : makeCacheableSignalKeyStore(authState.keys, logger),
             },
-            printQRInTerminal  : false,
+            printQRInTerminal: false,
             logger,
-            browser            : [BOT_NAME, 'Chrome', '120.0.0'],
+
+            // ✅ CRITICAL FIX:
+            // Must use Browsers.macOS() during pairing — custom browser strings
+            // cause WhatsApp to reject the pairing code with "Couldn't link device"
+            // After pairing succeeds and session is saved, this still works fine.
+            browser: Browsers.macOS('Chrome'),
+
             connectTimeoutMs   : 60_000,
             keepAliveIntervalMs: 25_000,
             retryRequestDelayMs: 2_000,
@@ -156,12 +152,10 @@ async function startBot() {
         // ── Connection events ───────────────────────────────
         sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
 
-            // ✅ CORRECT: request pairing AFTER 'connecting' fires
-            // This is when WhatsApp has handshaked and is ready
+            // ✅ Request pairing code at 'connecting' stage — correct per Baileys docs
             if (connection === 'connecting') {
                 console.log('[BOT] Connecting to WhatsApp...')
-                if (!sock.authState.creds.registered && !pairingShown) {
-                    await sleep(2000) // small wait for handshake to complete
+                if (!isRegistered && !pairingShown) {
                     startPairing(sock)
                 }
             }
@@ -184,14 +178,10 @@ async function startBot() {
                 stopPairingTimer()
 
                 const boom = lastDisconnect?.error
-                const code = (boom instanceof Boom)
-                    ? boom.output?.statusCode
-                    : 500
-
+                const code = (boom instanceof Boom) ? boom.output?.statusCode : 500
                 console.log(`[BOT] Disconnected — code ${code}`)
 
                 switch (code) {
-
                     case DisconnectReason.loggedOut:
                         console.log('[BOT] Logged out. Clearing session...')
                         clearSession()
