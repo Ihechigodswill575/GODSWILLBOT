@@ -396,18 +396,22 @@ async function startBot() {
     if (!sock.authState.creds.registered) {
         const number = '2348145688688'
         
-        const showCode = async () => {
+        const showCode = async (attempt = 1) => {
             try {
                 const code = await sock.requestPairingCode(number)
                 console.log(`\n🔑 TAVIK BOT Pairing Code: ${code}`)
                 console.log(`⏳ Code refreshes in 50 seconds...\n`)
             } catch (e) {
                 console.log('Pairing code error:', e.message)
+                if (attempt < 5) {
+                    console.log(`Retrying in 10 seconds... (attempt ${attempt}/5)`)
+                    setTimeout(() => showCode(attempt + 1), 10000)
+                }
             }
         }
 
-        // Show first code after 5 seconds
-        setTimeout(showCode, 5000)
+        // Show first code after 15 seconds
+        setTimeout(showCode, 15000)
 
         // Keep refreshing every 50 seconds
         setInterval(async () => {
