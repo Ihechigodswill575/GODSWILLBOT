@@ -1295,16 +1295,17 @@ async function startBot() {
     })
 
     // Keep alive
+    const PORT = process.env.PORT || 3000
     const server = http.createServer((req, res) => res.end(`${BOT_NAME} Running! ⚡`))
-    server.listen(3000, () => {
+    server.listen(PORT, () => {
         console.log(`\n✅ ${BOT_NAME} ${BOT_VERSION} Started!`)
         console.log(`👑 Owner: ${OWNER_NAME}`)
         console.log(`⚡ Powered by TAVIK TECH\n`)
     })
     server.on('error', (err) => {
         if (err.code === 'EADDRINUSE') {
-            console.log('Port 3000 busy, trying 3001...')
-            server.listen(3001)
+            console.log(`Port ${PORT} busy, trying ${PORT + 1}...`)
+            server.listen(PORT + 1)
         } else {
             console.log('Server error:', err.message)
         }
