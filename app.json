@@ -1,0 +1,26 @@
+{
+  "name": "TAVIK BOT",
+  "description": "TAVIK BOT V1.0 by GODSWILL (TAVIK) - Powered by TAVIK TECH",
+  "repository": "https://github.com/lhechigodswill575/GODSWILLBOT",
+  "keywords": ["whatsapp", "bot", "tavik", "godswill"],
+  "env": {
+    "OWNER_NUMBER": {
+      "description": "Your WhatsApp number with country code",
+      "value": "2348145688688"
+    },
+    "BOT_NAME": {
+      "description": "Name of your bot",
+      "value": "TAVIK BOT"
+    }
+  },
+  "formation": {
+    "web": {
+      "quantity": 1
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/nodejs"
+    }
+  ]
+}
