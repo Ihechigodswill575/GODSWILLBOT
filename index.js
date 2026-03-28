@@ -19,6 +19,24 @@ function clearPairingInterval() {
     }
 }
 
+// ======= KEEP ALIVE SERVER (outside startBot so it only starts once) =======
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' })
+    res.end(`${BOT_NAME} is Running! ⚡\nStatus: ${isConnected ? '🟢 Connected' : '🔴 Connecting...'}\nOwner: ${OWNER_NAME}`)
+})
+
+server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+        console.log('⚠️ Port already in use, skipping server start...')
+    } else {
+        console.log('Server error:', e.message)
+    }
+})
+
+server.listen(process.env.PORT || 3000, () => {
+    console.log(`🌐 Keep-alive server running on port ${process.env.PORT || 3000}`)
+})
+
 async function startBot() {
     const { state: authState, saveCreds } = await useMultiFileAuthState('auth_info')
 
@@ -74,7 +92,7 @@ async function startBot() {
 
     // ======= SMART CONNECTION HANDLER =======
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update
+        const { connection, lastDisconnect } = update
 
         if (connection === 'connecting') {
             console.log('🔄 Connecting to WhatsApp...')
@@ -101,10 +119,8 @@ async function startBot() {
 
             console.log(`\n❌ Disconnected! Status: ${statusCode}`)
 
-            // Handle different disconnect reasons smartly
             if (statusCode === reason.loggedOut) {
                 console.log('🚪 Logged out! Session cleared. Restarting...')
-                // Clear session and restart fresh
                 try {
                     const fs = require('fs')
                     if (fs.existsSync('auth_info')) {
@@ -116,7 +132,6 @@ async function startBot() {
 
             } else if (statusCode === reason.connectionReplaced) {
                 console.log('📱 Connection replaced by another device!')
-                // Don't reconnect — another device took over
 
             } else if (statusCode === reason.timedOut) {
                 console.log('⏰ Connection timed out. Reconnecting...')
@@ -136,7 +151,6 @@ async function startBot() {
                 }
 
             } else {
-                // Default — try to reconnect
                 console.log('🔄 Unknown disconnect. Reconnecting in 5s...')
                 setTimeout(startBot, 5000)
             }
@@ -164,14 +178,6 @@ async function startBot() {
         if (!msg || msg.key.fromMe) return
         await handleMessage(sock, msg)
     })
-
-    // ======= KEEP ALIVE SERVER =======
-    try {
-        http.createServer((req, res) => {
-            res.writeHead(200, { 'Content-Type': 'text/plain' })
-            res.end(`${BOT_NAME} is Running! ⚡\nStatus: ${isConnected ? '🟢 Connected' : '🔴 Connecting...'}\nOwner: ${OWNER_NAME}`)
-        }).listen(process.env.PORT || 3000)
-    } catch (e) {}
 
     console.log(`\n🚀 ${BOT_NAME} Starting...`)
     console.log(`👑 Owner: ${OWNER_NAME}`)
