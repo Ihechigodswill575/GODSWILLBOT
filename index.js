@@ -388,12 +388,15 @@ async function startBot() {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update
         if (connection === 'close') {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401
-            console.log('Connection closed. Reconnecting:', shouldReconnect)
-            if (shouldReconnect) {
-                startBot()
-            } else {
-                console.log('⚠️ Session logged out. Delete auth_info folder and restart.')
+            const statusCode = lastDisconnect?.error?.output?.statusCode
+            const shouldReconnect = statusCode !== 401 && statusCode !== 403
+            console.log('Connection closed. Reconnecting:', shouldReconnect, '| Code:', statusCode)
+            if (statusCode === 401 || statusCode === 403) {
+                console.log('⚠️ Session logged out. Clearing auth and restarting...')
+                try { fs.rmSync('auth_info', { recursive: true, force: true }) } catch (e) {}
+                setTimeout(() => startBot(), 3000)
+            } else if (shouldReconnect) {
+                setTimeout(() => startBot(), 3000)
             }
         } else if (connection === 'open') {
             console.log('✅ Connected to WhatsApp!')
@@ -1295,7 +1298,7 @@ async function startBot() {
     })
 
     // Keep alive
-    const PORT = process.env.PORT || 3000
+    const PORT = parseInt(process.env.PORT || '3000')
     const server = http.createServer((req, res) => res.end(`${BOT_NAME} Running! ⚡`))
     server.listen(PORT, () => {
         console.log(`\n✅ ${BOT_NAME} ${BOT_VERSION} Started!`)
@@ -1305,7 +1308,7 @@ async function startBot() {
     server.on('error', (err) => {
         if (err.code === 'EADDRINUSE') {
             console.log(`Port ${PORT} busy, trying ${PORT + 1}...`)
-            server.listen(PORT + 1)
+            server.listen(parseInt(PORT) + 1)
         } else {
             console.log('Server error:', err.message)
         }
