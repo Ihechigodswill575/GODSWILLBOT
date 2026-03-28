@@ -1,0 +1,18 @@
+{
+  "name": "tavik-bot",
+  "version": "1.0.0",
+  "description": "TAVIK BOT V1.0 by GODSWILL (TAVIK)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.0",
+    "pino": "^8.0.0",
+    "axios": "^1.6.0",
+    "form-data": "^4.0.0"
+  },
+  "keywords": ["whatsapp", "bot", "tavik"],
+  "author": "GODSWILL (TAVIK)",
+  "license": "MIT"
+}
