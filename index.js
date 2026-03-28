@@ -24,22 +24,20 @@ const { BOT_NAME, OWNER_NAME, OWNER_NUMBER } = require('./config')
 const state              = require('./state')
 
 // ── Constants ────────────────────────────────────────────────
-const PORT        = process.env.PORT || 3000
-const AUTH_FOLDER = 'auth_info'
-const MAX_RETRIES = 10
-const logger      = pino({ level: 'silent' })
-
-// Baileys requires the number with no + or spaces
-// e.g. '2348145688688' — digits only
-const PAIRING_NUMBER = OWNER_NUMBER.replace(/[^0-9]/g, '')
+const PORT           = process.env.PORT || 3000
+const AUTH_FOLDER    = 'auth_info'
+const MAX_RETRIES    = 10
+const logger         = pino({ level: 'silent' })
+const PAIRING_NUMBER = OWNER_NUMBER.replace(/[^0-9]/g, '') // digits only
 
 // ── Runtime state ────────────────────────────────────────────
 let isConnected   = false
 let retryCount    = 0
 let currentSock   = null
-let pairingTimer  = null   // holds the setInterval for code refresh
+let pairingTimer  = null
+let pairingShown  = false  // ensures we only start the pairing flow once per boot
 
-// ── Keep-alive server — boots ONCE, never restarts ───────────
+// ── Keep-alive server — boots ONCE ───────────────────────────
 const server = http.createServer((_, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' })
     res.end(
@@ -85,54 +83,54 @@ function reconnect(delayMs) {
     setTimeout(startBot, delayMs)
 }
 
-// ── Pairing code — shows once, then refreshes every 55s ──────
-// WhatsApp codes expire after ~60 seconds.
-// We refresh every 55s so the user always has a valid code.
+// ── Pairing — triggered AFTER 'connecting' event fires ───────
+// This is the correct time per Baileys docs.
+// Code refreshes every 55s since WhatsApp codes expire in ~60s.
 async function startPairing(sock) {
-    stopPairingTimer() // clear any old timer first
+    if (pairingShown) return
+    pairingShown = true
+    stopPairingTimer()
 
     const showCode = async () => {
-        // If already connected or socket changed, stop
         if (isConnected || currentSock !== sock) {
             stopPairingTimer()
             return
         }
         try {
-            const code = await sock.requestPairingCode(PAIRING_NUMBER)
+            const code      = await sock.requestPairingCode(PAIRING_NUMBER)
             const formatted = code.match(/.{1,4}/g)?.join('-') || code
             console.log('\n┌─────────────────────────────────┐')
-            console.log(`│   🔑  TAVIK BOT — Pairing Code   │`)
+            console.log(`│     🔑  TAVIK BOT Pairing Code   │`)
             console.log(`│                                  │`)
-            console.log(`│        ${formatted.padEnd(24)}│`)
+            console.log(`│         ${formatted.padEnd(23)}│`)
             console.log(`│                                  │`)
             console.log('│  1. Open WhatsApp on your phone  │')
             console.log('│  2. Tap ⋮ → Linked Devices       │')
             console.log('│  3. Tap "Link a Device"          │')
-            console.log('│  4. Enter the code above         │')
+            console.log('│  4. Enter the code above NOW     │')
             console.log('│                                  │')
-            console.log('│  ⏳ Code refreshes in 55s        │')
+            console.log('│  ⏳ Refreshes automatically       │')
             console.log('└─────────────────────────────────┘\n')
         } catch (e) {
-            console.error(`[PAIRING] ${e.message} — retrying in 55s`)
+            console.error(`[PAIRING] Failed: ${e.message}`)
+            pairingShown = false // allow retry
         }
     }
 
-    // Show immediately (after 5s warmup for connection to stabilise)
-    await sleep(5000)
-    if (isConnected) return   // connected during warmup — no pairing needed
+    // Show first code immediately
     await showCode()
 
-    // Then refresh every 55 seconds automatically
+    // Refresh every 55s automatically
     pairingTimer = setInterval(showCode, 55_000)
 }
 
-// ── Main bot function ─────────────────────────────────────────
+// ── Main bot ──────────────────────────────────────────────────
 async function startBot() {
     destroySocket()
     stopPairingTimer()
 
     try {
-        const { version }                    = await fetchLatestBaileysVersion()
+        const { version }                     = await fetchLatestBaileysVersion()
         const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER)
 
         const sock = makeWASocket({
@@ -155,27 +153,29 @@ async function startBot() {
         currentSock = sock
         sock.ev.on('creds.update', saveCreds)
 
-        // Start pairing flow only if no session exists
-        if (!sock.authState.creds.registered) {
-            startPairing(sock)
-        }
-
         // ── Connection events ───────────────────────────────
         sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
 
+            // ✅ CORRECT: request pairing AFTER 'connecting' fires
+            // This is when WhatsApp has handshaked and is ready
             if (connection === 'connecting') {
                 console.log('[BOT] Connecting to WhatsApp...')
+                if (!sock.authState.creds.registered && !pairingShown) {
+                    await sleep(2000) // small wait for handshake to complete
+                    startPairing(sock)
+                }
             }
 
             if (connection === 'open') {
-                isConnected = true
-                retryCount  = 0
+                isConnected  = true
+                retryCount   = 0
+                pairingShown = true
                 stopPairingTimer()
                 console.log(`\n╔══════════════════════════════╗`)
-                console.log(`║  ✅  ${BOT_NAME} is LIVE!         ║`)
-                console.log(`║  Owner  : ${OWNER_NAME.padEnd(19)}║`)
-                console.log(`║  Number : ${sock.user?.id?.split(':')[0]?.padEnd(19)}║`)
-                console.log(`║  Engine : TAVIK TECH          ║`)
+                console.log(`║   ✅  ${BOT_NAME} is LIVE!      ║`)
+                console.log(`║   Owner  : ${OWNER_NAME.padEnd(18)}║`)
+                console.log(`║   Number : ${sock.user?.id?.split(':')[0]?.padEnd(18)}║`)
+                console.log(`║   Engine : TAVIK TECH         ║`)
                 console.log(`╚══════════════════════════════╝\n`)
             }
 
@@ -195,18 +195,19 @@ async function startBot() {
                     case DisconnectReason.loggedOut:
                         console.log('[BOT] Logged out. Clearing session...')
                         clearSession()
-                        retryCount = 0
+                        pairingShown = false
+                        retryCount   = 0
                         reconnect(3_000)
                         break
 
                     case DisconnectReason.connectionReplaced:
                         console.log('[BOT] Another device connected. Halting.')
-                        // Do NOT reconnect
                         break
 
                     case DisconnectReason.badSession:
-                        console.log('[BOT] Bad session. Clearing and restarting...')
+                        console.log('[BOT] Bad session. Clearing...')
                         clearSession()
+                        pairingShown = false
                         reconnect(5_000)
                         break
 
@@ -220,7 +221,7 @@ async function startBot() {
                             console.log(`[BOT] Retry ${retryCount}/${MAX_RETRIES}`)
                             reconnect(delay)
                         } else {
-                            console.log('[BOT] Max retries hit. Cooling down 60s...')
+                            console.log('[BOT] Max retries. Cooling down 60s...')
                             retryCount = 0
                             reconnect(60_000)
                         }
@@ -236,7 +237,7 @@ async function startBot() {
                     const jid = key.remoteJid
                     if (!state.antiDelete[jid]?.enabled) continue
                     await sock.sendMessage(`${PAIRING_NUMBER}@s.whatsapp.net`, {
-                        text : `🗑️ *Anti-Delete Alert*\nChat : ${jid}\nBy   : ${key.participant || jid}`
+                        text: `🗑️ *Anti-Delete Alert*\nChat : ${jid}\nBy   : ${key.participant || jid}`
                     })
                 }
             } catch (_) {}
