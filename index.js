@@ -10,7 +10,7 @@ const OWNER = OWNER_NUMBER + '@s.whatsapp.net'
 const OWNER_NAME = 'TAVIK(GODSWILL)'
 const BOT_NAME = 'TAVIK BOT'
 const BOT_VERSION = 'V1.0'
-const UNSPLASH_KEY = 'YOUR_NEW_UNSPLASH_KEY' // 🔁 Replace with your new key
+const UNSPLASH_KEY = 'lE3LTM9IWIahm1jhcw6_Gn8L2_6hnyzK-NBrg6urD5w'
 
 // Free AI - Using pollinations.ai (no key needed)
 const AI_API = 'https://text.pollinations.ai/'
@@ -20,6 +20,9 @@ let floodActive = {}
 let antiDelete = {}
 let autoreply = {}
 let antibadword = {}
+let antilink = {}
+let antispam = {}
+let spamTracker = {}
 let autoread = false
 let autoreact = false
 let autotyping = false
@@ -165,13 +168,14 @@ async function upscaleImage(buffer) {
         const FormData = require('form-data')
         const form = new FormData()
         form.append('image', buffer, { filename: 'image.jpg', contentType: 'image/jpeg' })
-        const res = await axios.post('https://api.deepai.org/api/torch-srgan', form, {
-            headers: { ...form.getHeaders(), 'api-key': 'quickstart-QUdJIGlzIGZ1bg' },
-            timeout: 30000
+        form.append('scale', '2')
+        const res = await axios.post('https://waifu2x.udp.jp/api', form, {
+            headers: { ...form.getHeaders() },
+            responseType: 'arraybuffer',
+            timeout: 60000
         })
-        const url = res.data?.output_url
-        if (!url) return null
-        return await downloadBuffer(url)
+        if (!res.data) return null
+        return Buffer.from(res.data)
     } catch (e) { return null }
 }
 
@@ -309,6 +313,53 @@ const eightBallAnswers = [
     '❌ Don\'t count on it', '❌ Very doubtful', '❌ Definitely not!'
 ]
 
+// ======= CURRENCY =======
+async function convertCurrency(amount, from, to) {
+    try {
+        const res = await axios.get(`https://open.er-api.com/v6/latest/${from.toUpperCase()}`, { timeout: 10000 })
+        const rate = res.data.rates[to.toUpperCase()]
+        if (!rate) return null
+        return (amount * rate).toFixed(2)
+    } catch (e) { return null }
+}
+
+// ======= TRANSLATE =======
+async function translateText(text, targetLang) {
+    try {
+        const res = await axios.get(`https://api.mymemory.translated.net/get`, {
+            params: { q: text, langpair: `en|${targetLang}` },
+            timeout: 10000
+        })
+        return res.data.responseData.translatedText || null
+    } catch (e) { return null }
+}
+
+// ======= DICTIONARY =======
+async function getDictionary(word) {
+    try {
+        const res = await axios.get(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`, { timeout: 10000 })
+        const entry = res.data[0]
+        const meaning = entry.meanings[0]
+        const def = meaning.definitions[0]
+        return {
+            word: entry.word,
+            partOfSpeech: meaning.partOfSpeech,
+            definition: def.definition,
+            example: def.example || null,
+            phonetic: entry.phonetic || ''
+        }
+    } catch (e) { return null }
+}
+
+// ======= TOSTICKER =======
+async function imageToSticker(buffer) {
+    try {
+        const sharp = require('sharp')
+        const webp = await sharp(buffer).resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }).webp().toBuffer()
+        return webp
+    } catch (e) { return null }
+}
+
 // ======= MAIN BOT =======
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info')
@@ -316,10 +367,30 @@ async function startBot() {
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
-        logger: pino({ level: 'silent' })
+        logger: pino({ level: 'silent' }),
+        keepAliveIntervalMs: 30000,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 60000,
+        retryRequestDelayMs: 2000,
     })
 
     sock.ev.on('creds.update', saveCreds)
+
+    // ======= CONNECTION HANDLER (keeps session alive) =======
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401
+            console.log('Connection closed. Reconnecting:', shouldReconnect)
+            if (shouldReconnect) {
+                startBot()
+            } else {
+                console.log('⚠️ Session logged out. Delete auth_info folder and restart.')
+            }
+        } else if (connection === 'open') {
+            console.log('✅ Connected to WhatsApp!')
+        }
+    })
 
     // ======= AUTO PAIRING (keeps refreshing every 50 seconds) =======
     if (!sock.authState.creds.registered) {
@@ -404,11 +475,38 @@ async function startBot() {
             if (isGroup && antibadword[from]) {
                 const hasBadWord = BAD_WORDS.some(w => text.toLowerCase().includes(w))
                 if (hasBadWord && !isPrivileged) {
-                    await sock.sendMessage(from, {
-                        delete: msg.key
-                    })
+                    await sock.sendMessage(from, { delete: msg.key })
                     await sock.sendMessage(from, {
                         text: `⚠️ @${senderNumber} Watch your language!`,
+                        mentions: [sender]
+                    })
+                    return
+                }
+            }
+
+            // ======= ANTI LINK =======
+            if (isGroup && antilink[from] && !isPrivileged) {
+                const linkRegex = /(https?:\/\/|chat\.whatsapp\.com|t\.me\/|wa\.me\/)/i
+                if (linkRegex.test(text)) {
+                    await sock.sendMessage(from, { delete: msg.key })
+                    await sock.sendMessage(from, {
+                        text: `⚠️ @${senderNumber} No links allowed in this group!`,
+                        mentions: [sender]
+                    })
+                    return
+                }
+            }
+
+            // ======= ANTI SPAM =======
+            if (isGroup && antispam[from] && !isPrivileged) {
+                const now = Date.now()
+                if (!spamTracker[sender]) spamTracker[sender] = []
+                spamTracker[sender] = spamTracker[sender].filter(t => now - t < 5000)
+                spamTracker[sender].push(now)
+                if (spamTracker[sender].length > 5) {
+                    await sock.sendMessage(from, { delete: msg.key })
+                    await sock.sendMessage(from, {
+                        text: `⚠️ @${senderNumber} Stop spamming!`,
                         mentions: [sender]
                     })
                     return
@@ -914,6 +1012,269 @@ async function startBot() {
                 if (!isPrivileged) return
                 autotyping = args[1]?.toLowerCase() === 'on'
                 await sock.sendMessage(from, { text: `${autotyping ? '✅' : '❌'} Auto typing ${autotyping ? 'ON' : 'OFF'}!` }, { quoted: msg })
+            }
+
+            // ===== CURRENCY =====
+            else if (cmd === '.currency') {
+                // Usage: .currency 100 USD NGN
+                if (!args[1] || !args[2] || !args[3]) return sock.sendMessage(from, {
+                    text: '❌ Usage: .currency <amount> <from> <to>\nExample: .currency 100 USD NGN'
+                }, { quoted: msg })
+                const amount = parseFloat(args[1])
+                if (isNaN(amount)) return sock.sendMessage(from, { text: '❌ Invalid amount!' }, { quoted: msg })
+                await sock.sendMessage(from, { text: '💱 Converting...' }, { quoted: msg })
+                const result = await convertCurrency(amount, args[2], args[3])
+                if (!result) return sock.sendMessage(from, { text: '❌ Invalid currency code or service unavailable.' }, { quoted: msg })
+                await sock.sendMessage(from, {
+                    text: `💱 *Currency Converter*\n\n${amount} ${args[2].toUpperCase()} = *${result} ${args[3].toUpperCase()}*\n\n⚡ ${BOT_NAME}`
+                }, { quoted: msg })
+            }
+
+            // ===== TRANSLATE =====
+            else if (cmd === '.translate') {
+                // Usage: .translate fr Hello how are you
+                if (!args[1] || !query) return sock.sendMessage(from, {
+                    text: '❌ Usage: .translate <lang-code> <text>\nExample: .translate fr Hello how are you\n\nCodes: fr=French, es=Spanish, de=German, ar=Arabic, yo=Yoruba, ig=Igbo, ha=Hausa'
+                }, { quoted: msg })
+                const targetLang = args[1]
+                const textToTranslate = args.slice(2).join(' ')
+                if (!textToTranslate) return sock.sendMessage(from, { text: '❌ Please provide text to translate!' }, { quoted: msg })
+                await sock.sendMessage(from, { text: '🌍 Translating...' }, { quoted: msg })
+                const translated = await translateText(textToTranslate, targetLang)
+                if (!translated) return sock.sendMessage(from, { text: '❌ Translation failed!' }, { quoted: msg })
+                await sock.sendMessage(from, {
+                    text: `🌍 *Translation*\n\n📝 Original: ${textToTranslate}\n✅ Translated (${targetLang}): ${translated}\n\n⚡ ${BOT_NAME}`
+                }, { quoted: msg })
+            }
+
+            // ===== DICTIONARY =====
+            else if (cmd === '.dictionary' || cmd === '.dict') {
+                if (!query) return sock.sendMessage(from, { text: '❌ Usage: .dictionary <word>\nExample: .dictionary ephemeral' }, { quoted: msg })
+                await sock.sendMessage(from, { text: `📖 Looking up *${query}*...` }, { quoted: msg })
+                const result = await getDictionary(query.split(' ')[0])
+                if (!result) return sock.sendMessage(from, { text: `❌ Word not found: *${query}*` }, { quoted: msg })
+                await sock.sendMessage(from, {
+                    text: `📖 *Dictionary: ${result.word}*\n${result.phonetic ? `🔊 ${result.phonetic}\n` : ''}📌 Part of Speech: ${result.partOfSpeech}\n\n📝 Definition:\n${result.definition}${result.example ? `\n\n💬 Example:\n"${result.example}"` : ''}\n\n⚡ ${BOT_NAME}`
+                }, { quoted: msg })
+            }
+
+            // ===== QRCODE =====
+            else if (cmd === '.qrcode' || cmd === '.qr') {
+                if (!query) return sock.sendMessage(from, { text: '❌ Usage: .qrcode <text or link>\nExample: .qrcode https://wa.me/2348145688688' }, { quoted: msg })
+                await sock.sendMessage(from, { text: '🔲 Generating QR Code...' }, { quoted: msg })
+                const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=512x512&data=${encodeURIComponent(query)}`
+                const buf = await downloadBuffer(qrUrl)
+                if (!buf) return sock.sendMessage(from, { text: '❌ Failed to generate QR code!' }, { quoted: msg })
+                await sock.sendMessage(from, {
+                    image: buf,
+                    caption: `🔲 *QR Code*\n\n📝 Content: ${query}\n\n⚡ ${BOT_NAME}`
+                }, { quoted: msg })
+            }
+
+            // ===== TOSTICKER =====
+            else if (cmd === '.tosticker') {
+                const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+                const imageMsg = quoted?.imageMessage || msg.message?.imageMessage
+                if (!imageMsg) return sock.sendMessage(from, { text: '❌ Reply to an image with .tosticker' }, { quoted: msg })
+                await sock.sendMessage(from, { text: '🎨 Converting to sticker...' }, { quoted: msg })
+                try {
+                    const buffer = await downloadMediaMessage(
+                        { message: quoted ? { imageMessage: imageMsg } : msg.message, key: msg.key },
+                        'buffer', {}
+                    )
+                    const stickerBuf = await imageToSticker(buffer)
+                    if (!stickerBuf) return sock.sendMessage(from, { text: '❌ Failed! Make sure sharp is installed: npm install sharp' }, { quoted: msg })
+                    await sock.sendMessage(from, {
+                        sticker: stickerBuf
+                    }, { quoted: msg })
+                } catch (e) {
+                    await sock.sendMessage(from, { text: '❌ Sticker conversion failed!' }, { quoted: msg })
+                }
+            }
+
+            // ===== TOIMG (sticker to image) =====
+            else if (cmd === '.toimg') {
+                const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+                const stickerMsg = quoted?.stickerMessage || msg.message?.stickerMessage
+                if (!stickerMsg) return sock.sendMessage(from, { text: '❌ Reply to a sticker with .toimg' }, { quoted: msg })
+                await sock.sendMessage(from, { text: '🖼️ Converting sticker to image...' }, { quoted: msg })
+                try {
+                    const buffer = await downloadMediaMessage(
+                        { message: quoted ? { stickerMessage: stickerMsg } : msg.message, key: msg.key },
+                        'buffer', {}
+                    )
+                    await sock.sendMessage(from, {
+                        image: buffer,
+                        caption: `✅ *Sticker converted to image!*\n⚡ ${BOT_NAME}`
+                    }, { quoted: msg })
+                } catch (e) {
+                    await sock.sendMessage(from, { text: '❌ Conversion failed!' }, { quoted: msg })
+                }
+            }
+
+            // ===== TOMP3 (video to audio) =====
+            else if (cmd === '.tomp3') {
+                const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+                const videoMsg = quoted?.videoMessage || msg.message?.videoMessage
+                if (!videoMsg) return sock.sendMessage(from, { text: '❌ Reply to a video with .tomp3' }, { quoted: msg })
+                await sock.sendMessage(from, { text: '🎵 Extracting audio...' }, { quoted: msg })
+                try {
+                    const buffer = await downloadMediaMessage(
+                        { message: quoted ? { videoMessage: videoMsg } : msg.message, key: msg.key },
+                        'buffer', {}
+                    )
+                    await sock.sendMessage(from, {
+                        audio: buffer,
+                        mimetype: 'audio/mp4',
+                        ptt: false
+                    }, { quoted: msg })
+                } catch (e) {
+                    await sock.sendMessage(from, { text: '❌ Conversion failed!' }, { quoted: msg })
+                }
+            }
+
+            // ===== SAVE (save replied media) =====
+            else if (cmd === '.save') {
+                const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+                if (!quoted) return sock.sendMessage(from, { text: '❌ Reply to a media message with .save' }, { quoted: msg })
+                await sock.sendMessage(from, { text: '💾 Saving media...' }, { quoted: msg })
+                try {
+                    const mediaType = Object.keys(quoted)[0]
+                    const buffer = await downloadMediaMessage(
+                        { message: quoted, key: msg.key },
+                        'buffer', {}
+                    )
+                    if (!buffer) return sock.sendMessage(from, { text: '❌ Could not download media!' }, { quoted: msg })
+                    await sock.sendMessage(msg.key.remoteJid, {
+                        [mediaType === 'imageMessage' ? 'image' :
+                         mediaType === 'videoMessage' ? 'video' :
+                         mediaType === 'audioMessage' ? 'audio' :
+                         mediaType === 'documentMessage' ? 'document' : 'image']: buffer,
+                        caption: `✅ *Saved!*\n⚡ ${BOT_NAME}`,
+                        mimetype: quoted[mediaType]?.mimetype
+                    })
+                } catch (e) {
+                    await sock.sendMessage(from, { text: '❌ Failed to save media!' }, { quoted: msg })
+                }
+            }
+
+            // ===== SAVESTATUS =====
+            else if (cmd === '.savestatus') {
+                const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+                if (!quoted) return sock.sendMessage(from, { text: '❌ Reply to a status with .savestatus' }, { quoted: msg })
+                await sock.sendMessage(from, { text: '💾 Saving status...' }, { quoted: msg })
+                try {
+                    const buffer = await downloadMediaMessage(
+                        { message: quoted, key: msg.key },
+                        'buffer', {}
+                    )
+                    if (!buffer) return sock.sendMessage(from, { text: '❌ Could not download status!' }, { quoted: msg })
+                    const isVideo = quoted.videoMessage
+                    await sock.sendMessage(OWNER, {
+                        [isVideo ? 'video' : 'image']: buffer,
+                        caption: `✅ *Status Saved!*\n⚡ ${BOT_NAME}`
+                    })
+                    await sock.sendMessage(from, { text: '✅ Status saved and sent to your DM!' }, { quoted: msg })
+                } catch (e) {
+                    await sock.sendMessage(from, { text: '❌ Failed to save status!' }, { quoted: msg })
+                }
+            }
+
+            // ===== TIKTOK =====
+            else if (cmd === '.tiktok') {
+                if (!query) return sock.sendMessage(from, { text: '❌ Usage: .tiktok <tiktok link>' }, { quoted: msg })
+                await sock.sendMessage(from, { text: '⏳ Downloading TikTok video...' }, { quoted: msg })
+                try {
+                    const res = await axios.get(`https://api.tikmate.app/api/lookup?url=${encodeURIComponent(query)}`, { timeout: 30000 })
+                    const videoUrl = res.data?.video_url_download_fastest || res.data?.video_url
+                    if (!videoUrl) return sock.sendMessage(from, { text: '❌ Could not extract video. Make sure the link is valid!' }, { quoted: msg })
+                    const buf = await downloadBuffer(videoUrl)
+                    if (!buf) return sock.sendMessage(from, { text: '❌ Failed to download video!' }, { quoted: msg })
+                    await sock.sendMessage(from, {
+                        video: buf,
+                        caption: `✅ *TikTok Video Downloaded!*\n⚡ ${BOT_NAME}`
+                    }, { quoted: msg })
+                } catch (e) {
+                    await sock.sendMessage(from, { text: '❌ TikTok download failed! The link may be invalid.' }, { quoted: msg })
+                }
+            }
+
+            // ===== YTSEARCH =====
+            else if (cmd === '.ytsearch') {
+                if (!query) return sock.sendMessage(from, { text: '❌ Usage: .ytsearch <search term>' }, { quoted: msg })
+                await sock.sendMessage(from, { text: `🔍 Searching YouTube for *${query}*...` }, { quoted: msg })
+                try {
+                    const res = await axios.get(`https://www.googleapis.com/youtube/v3/search`, {
+                        params: {
+                            part: 'snippet',
+                            q: query,
+                            maxResults: 5,
+                            type: 'video',
+                            key: 'AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY' // Free public demo key - replace if needed
+                        },
+                        timeout: 10000
+                    }).catch(() => null)
+
+                    if (!res || !res.data.items?.length) {
+                        // Fallback: use invidious
+                        const inv = await axios.get(`https://invidious.fdn.fr/api/v1/search?q=${encodeURIComponent(query)}&type=video`, { timeout: 10000 })
+                        const results = inv.data?.slice(0, 5)
+                        if (!results?.length) return sock.sendMessage(from, { text: '❌ No results found!' }, { quoted: msg })
+                        const text = results.map((v, i) =>
+                            `${i + 1}. *${v.title}*\n   👤 ${v.author}\n   ⏱️ ${Math.floor(v.lengthSeconds / 60)}m ${v.lengthSeconds % 60}s\n   🔗 https://youtu.be/${v.videoId}`
+                        ).join('\n\n')
+                        return await sock.sendMessage(from, {
+                            text: `🎬 *YouTube Search: ${query}*\n\n${text}\n\n⚡ ${BOT_NAME}`
+                        }, { quoted: msg })
+                    }
+
+                    const text = res.data.items.map((v, i) =>
+                        `${i + 1}. *${v.snippet.title}*\n   👤 ${v.snippet.channelTitle}\n   🔗 https://youtu.be/${v.id.videoId}`
+                    ).join('\n\n')
+                    await sock.sendMessage(from, {
+                        text: `🎬 *YouTube Search: ${query}*\n\n${text}\n\n⚡ ${BOT_NAME}`
+                    }, { quoted: msg })
+                } catch (e) {
+                    await sock.sendMessage(from, { text: '❌ YouTube search failed!' }, { quoted: msg })
+                }
+            }
+
+            // ===== ANTILINK =====
+            else if (cmd === '.antilink') {
+                if (!isGroup || !isPrivileged) return sock.sendMessage(from, { text: '❌ Only group admins can use this!' }, { quoted: msg })
+                const status = args[1]?.toLowerCase()
+                antilink[from] = status === 'on'
+                await sock.sendMessage(from, {
+                    text: `${status === 'on' ? '✅' : '❌'} Anti-link ${status === 'on' ? 'ON' : 'OFF'}!\n${status === 'on' ? 'Any WhatsApp/Telegram links will be deleted.' : ''}`
+                }, { quoted: msg })
+            }
+
+            // ===== ANTISPAM =====
+            else if (cmd === '.antispam') {
+                if (!isGroup || !isPrivileged) return sock.sendMessage(from, { text: '❌ Only group admins can use this!' }, { quoted: msg })
+                const status = args[1]?.toLowerCase()
+                antispam[from] = status === 'on'
+                await sock.sendMessage(from, {
+                    text: `${status === 'on' ? '✅' : '❌'} Anti-spam ${status === 'on' ? 'ON' : 'OFF'}!`
+                }, { quoted: msg })
+            }
+
+            // ===== MEME =====
+            else if (cmd === '.meme') {
+                await sock.sendMessage(from, { text: '😂 Getting a meme...' }, { quoted: msg })
+                try {
+                    const res = await axios.get('https://meme-api.com/gimme', { timeout: 10000 })
+                    const meme = res.data
+                    if (!meme?.url) return sock.sendMessage(from, { text: '❌ No meme found!' }, { quoted: msg })
+                    const buf = await downloadBuffer(meme.url)
+                    if (!buf) return sock.sendMessage(from, { text: '❌ Failed to load meme!' }, { quoted: msg })
+                    await sock.sendMessage(from, {
+                        image: buf,
+                        caption: `😂 *${meme.title}*\n\n⬆️ ${meme.ups} upvotes\n⚡ ${BOT_NAME}`
+                    }, { quoted: msg })
+                } catch (e) {
+                    await sock.sendMessage(from, { text: '❌ Meme fetch failed!' }, { quoted: msg })
+                }
             }
 
         } catch (err) {
